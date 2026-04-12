@@ -4,16 +4,25 @@ import com.UserOfTheDayBot.enums.Commands;
 import com.UserOfTheDayBot.enums.DBColumns;
 import com.UserOfTheDayBot.enums.Games;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.telegram.telegrambots.meta.api.methods.commands.SetMyCommands;
+import org.telegram.telegrambots.meta.api.objects.commands.BotCommand;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.User;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
-import java.text.SimpleDateFormat;
-import java.util.*;
 import com.UserOfTheDayBot.exceptions.existedUserException;
 
+import java.util.ArrayList;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.Random;
+import java.util.Timer;
+import java.util.TimerTask;
+
 public class Bot extends TelegramLongPollingBot {
+    private final AppConfig config;
 
     //class for sending messages with delay
     class TimerSendingTask extends TimerTask {
@@ -31,10 +40,7 @@ public class Bot extends TelegramLongPollingBot {
         }
     }
 
-    private final String BOT_USERNAME = "username";
-    private final String TOKEN = "token";
-
-    private String[] messagesForUserOfTheDay = {
+    private final String[] messagesForUserOfTheDay = {
             "\uD83C\uDF89 Сегодня красавчик дня - ",
             "ВНИМАНИЕ \uD83D\uDD25",
             "Ищем красавчика в этом чате",
@@ -43,34 +49,56 @@ public class Bot extends TelegramLongPollingBot {
             "Лунная призма дай мне силу \uD83D\uDCAB",
             "СЕКТОР ПРИЗ НА БАРАБАНЕ \uD83C\uDFAF"
     };
-    private String[] messagesForLoserOfTheDay = {
-            "\uD83C\uDF89 Сегодня неудачник \uD83C\uDF08 дня - ",
+    private final String[] messagesForLoserOfTheDay = {
+            "\uD83C\uDF89 Сегодня пидор \uD83C\uDF08 дня - ",
             "ВНИМАНИЕ \uD83D\uDD25",
-            "ФЕДЕРАЛЬНЫЙ \uD83D\uDD0D РОЗЫСК НЕУДАНИКА \uD83D\uDEA8",
+            "ФЕДЕРАЛЬНЫЙ \uD83D\uDD0D РОЗЫСК ПИДОРА \uD83D\uDEA8",
             "4 - спутник запущен \uD83D\uDE80",
             "3 - сводки Интерпола проверены \uD83D\uDE93",
             "2 - твои друзья опрошены \uD83D\uDE45",
             "1 - твой профиль в соцсетях проанализирован \uD83D\uDE40"
 
     };
-    //for DB
-    private String URL = "jdbc:mysql://localhost:3306/chats_users_db";
-    private String LOGIN = "root";
-    private String PASSWORD = "root";
+
+    public Bot(AppConfig config) {
+        this.config = config;
+    }
+
+    public void configureCommands() throws TelegramApiException {
+        List<BotCommand> commands = new ArrayList<BotCommand>();
+        commands.add(new BotCommand("reg", "чтобы участвовать в розыгрыше"));
+        commands.add(new BotCommand("delete", "чтобы сбежать с поля боя"));
+        commands.add(new BotCommand("run", "запустить барабан усатого чтобы узнать красавчика дня"));
+        commands.add(new BotCommand("pidor", "узнай кто пидор дня"));
+        commands.add(new BotCommand("stats", "результаты игры Красавчик"));
+        commands.add(new BotCommand("pidorstats", "результаты игры Пидор дня"));
+        execute(new SetMyCommands(commands, null, null));
+    }
 
     /*method that gets a message
     * then handles it and does action according to command
      */
     public void onUpdateReceived(Update update) {
+        if (update == null || !update.hasMessage() || !update.getMessage().hasText()) {
+            return;
+        }
+
         String message = update.getMessage().getText();
         if(!message.startsWith("/")){
             return;
         }
-        int commandEnd = message.lastIndexOf("@"+BOT_USERNAME);
+        int commandEnd = message.lastIndexOf("@" + getBotUsername());
         if(commandEnd == -1){
             commandEnd = message.length();
         }
-        Commands command = Commands.valueOf(message.substring(1, commandEnd));
+
+        Commands command;
+        try {
+            command = Commands.valueOf(message.substring(1, commandEnd));
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+
         String chatId = update.getMessage().getChatId().toString();
         switch (command) {
             case run:
@@ -79,13 +107,18 @@ public class Bot extends TelegramLongPollingBot {
             case reg:
                 addUserInGame(chatId, update.getMessage().getFrom());
                 break;
+            case delete:
+                removeUserFromGame(chatId, update.getMessage().getFrom());
+                break;
+            case stats:
             case stat_user:
                 sendStatisticOfTheGame(chatId,Games.user_of_the_day);
                 break;
-            case loser:
+            case pidor:
                 runGame(chatId,Games.loser_of_the_day);
                 break;
-            case stat_loser:
+            case pidorstats:
+            case stat_pidor:
                 sendStatisticOfTheGame(chatId,Games.loser_of_the_day);
                 break;
             default:
@@ -95,78 +128,103 @@ public class Bot extends TelegramLongPollingBot {
 
 
     private void runGame(String chatId,Games game){
-        DBHandler dbHandler = new DBHandler(URL, LOGIN, PASSWORD);
-        List<UserForBD> usersInGame = dbHandler.getListOfPlayers(chatId);
-        String[] messages;
-        if (usersInGame.size() == 0) {
-            sendMsg(chatId,"Нет игроков");
-            return;
-        }
-        switch (game){
-            case user_of_the_day:
-                if (dbHandler.isTheSameDayRunning(chatId,getToday(), DBColumns.user_of_the_day_run_day)) {
-                    sendMsg(chatId,messagesForUserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.user_of_the_day));
-                    return;
-                }
-                messages = messagesForUserOfTheDay;
-                break;
-            case loser_of_the_day:
-                if (dbHandler.isTheSameDayRunning(chatId,getToday(), DBColumns.loser_of_the_day_run_day)) {
-                    sendMsg(chatId, messagesForLoserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.loser_of_the_day));
-                    return;
-                }
-                messages = messagesForLoserOfTheDay;
-                break;
-
+        DBHandler dbHandler = new DBHandler(config);
+        try {
+            List<UserForBD> usersInGame = dbHandler.getListOfPlayers(chatId);
+            String[] messages;
+            if (usersInGame.size() == 0) {
+                sendMsg(chatId,"Нет игроков");
+                return;
+            }
+            switch (game){
+                case user_of_the_day:
+                    if (dbHandler.isTheSameDayRunning(chatId,getToday(), DBColumns.user_of_the_day_run_day)) {
+                        sendMsg(chatId,messagesForUserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.user_of_the_day));
+                        return;
+                    }
+                    messages = messagesForUserOfTheDay;
+                    break;
+                case loser_of_the_day:
+                    if (dbHandler.isTheSameDayRunning(chatId,getToday(), DBColumns.loser_of_the_day_run_day)) {
+                        sendMsg(chatId, messagesForLoserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.loser_of_the_day));
+                        return;
+                    }
+                    messages = messagesForLoserOfTheDay;
+                    break;
                 default:
                     messages = null;
+            }
+            Timer timer = new Timer();
+            int MESSAGE_DELAY = 1500;
+            for(int  i = 1; i < messages.length; i++){
+                timer.schedule(new TimerSendingTask(chatId,messages[i]),MESSAGE_DELAY*i);
+            }
+            int i = new Random().nextInt(usersInGame.size());
+            UserForBD winner = usersInGame.get(i);
+            timer.schedule(new TimerSendingTask(chatId, messages[0] + winner.getNotificationName()),
+                    MESSAGE_DELAY*messages.length);
+            dbHandler.setWinnerAndDayRunning(chatId,winner,getToday(),game);
+        } finally {
+            dbHandler.closeConnection();
         }
-        Timer timer = new Timer();
-        int MESSAGE_DELAY = 1500;
-        for(int  i = 1; i < messages.length; i++){
-            timer.schedule(new TimerSendingTask(chatId,messages[i]),MESSAGE_DELAY*i);
-        }
-        int i = new Random().nextInt(usersInGame.size());
-        UserForBD winner = usersInGame.get(i);
-        timer.schedule(new TimerSendingTask(chatId, messages[0] + winner.getNotificationName()),
-                MESSAGE_DELAY*messages.length);
-        dbHandler.setWinnerAndDayRunning(chatId,winner,getToday(),game);
-        dbHandler.closeConnection();
     }
     private void addUserInGame(String chatId, User user){
+        DBHandler dbHandler = new DBHandler(config);
         try {
-            DBHandler dbHandler = new DBHandler(URL, LOGIN, PASSWORD);
             dbHandler.registration(chatId, user);
-            dbHandler.closeConnection();
         }catch (existedUserException e){
             sendMsg(chatId, "Ты уже в игре");
             return;
+        } finally {
+            dbHandler.closeConnection();
         }
         sendMsg(chatId, user.getFirstName() + ", Ты в игре");
+    }
+
+    private void removeUserFromGame(String chatId, User user){
+        DBHandler dbHandler = new DBHandler(config);
+        boolean removed;
+        try {
+            removed = dbHandler.removeRegistration(chatId, user);
+        } finally {
+            dbHandler.closeConnection();
+        }
+
+        if (removed) {
+            sendMsg(chatId, user.getFirstName() + ", Ты вышел из игры");
+        } else {
+            sendMsg(chatId, "Тебя нет в игре");
+        }
     }
 
     private void sendStatisticOfTheGame(String chatId,Games game) {
         String message = null;
         StringBuilder statisticUserOfTheDay = null;
-        DBHandler dbHandler = new DBHandler(URL, LOGIN, PASSWORD);
-        int i=1;
-        switch (game){
-            case user_of_the_day:
-                message = "\uD83C\uDF89 Результаты Красавчик Дня\n";
-                statisticUserOfTheDay = new StringBuilder(message);
-                for (UserForBD user : dbHandler.getListOfPlayers(chatId)) {
-                    statisticUserOfTheDay.append(i++ + ")" + user.getNotificationName() +" - " +user.getUserDayCounter()  + " раз(а)\n");
-                }
-                break;
-            case loser_of_the_day:
-                message = "Результаты \uD83C\uDF08НЕУДАЧНИКА Дня\n";
-                statisticUserOfTheDay = new StringBuilder(message);
-                for (UserForBD user : dbHandler.getListOfPlayers(chatId)) {
-                    statisticUserOfTheDay.append(i++ + ")" + user.getNotificationName() +" - " +user.getLoserDayCounter()  + " раз(а)\n");
-                }
-                break;
+        DBHandler dbHandler = new DBHandler(config);
+        try {
+            int i=1;
+            List<UserForBD> users = dbHandler.getListOfPlayers(chatId);
+            switch (game){
+                case user_of_the_day:
+                    message = "\uD83C\uDF89 Результаты Красавчик Дня\n";
+                    statisticUserOfTheDay = new StringBuilder(message);
+                    users.sort((left, right) -> Integer.compare(right.getUserDayCounter(), left.getUserDayCounter()));
+                    for (UserForBD user : users) {
+                        statisticUserOfTheDay.append(i++ + ")" + user.getNotificationName() +" - " +user.getUserDayCounter()  + " раз(а)\n");
+                    }
+                    break;
+                case loser_of_the_day:
+                    message = "Результаты игры \uD83C\uDF08Пидор Дня\n";
+                    statisticUserOfTheDay = new StringBuilder(message);
+                    users.sort((left, right) -> Integer.compare(right.getLoserDayCounter(), left.getLoserDayCounter()));
+                    for (UserForBD user : users) {
+                        statisticUserOfTheDay.append(i++ + ")" + user.getNotificationName() +" - " +user.getLoserDayCounter()  + " раз(а)\n");
+                    }
+                    break;
+            }
+        } finally {
+            dbHandler.closeConnection();
         }
-        dbHandler.closeConnection();
         sendMsg(chatId, statisticUserOfTheDay.toString());
     }
 
@@ -184,15 +242,15 @@ public class Bot extends TelegramLongPollingBot {
     }
     //method returns signed up username of bot
     public String getBotUsername() {
-        return BOT_USERNAME;
+        return config.getBotUsername();
     }
 
     @Override
     public String getBotToken() {
-        return TOKEN;
+        return config.getBotToken();
     }
 
     private int getToday(){
-        return Integer.valueOf(new SimpleDateFormat("DD").format(new Date()));
+        return LocalDate.now(ZoneId.of(config.getBotTimezone())).getDayOfYear();
     }
 }

@@ -13,69 +13,140 @@ import com.UserOfTheDayBot.exceptions.existedUserException;
 
 public class DBHandler {
     private Connection connection;
-    public DBHandler(){
+    public DBHandler() {
+    }
 
+    public DBHandler(AppConfig config) {
+        connectToDB(
+                config.getDbUrl(),
+                config.getDbUser(),
+                config.getDbPassword(),
+                config.getDbConnectRetries(),
+                config.getDbConnectRetryDelayMs()
+        );
     }
-    public DBHandler(String url,String login,String password) {
-            connectToDB(url,login,password);
-    }
-    public void connectToDB(String url,String login,String password){
+
+    public void connectToDB(String url,String login,String password, int maxAttempts, long retryDelayMs){
         Properties properties = new Properties();
-        properties.put("User", login);
+        properties.put("user", login);
         properties.put("password", password);
         properties.put("autoReconnect", "true");
-        properties.put("characterUnicode", "true");
+        properties.put("characterEncoding", "UTF-8");
         properties.put("useUnicode", "true");
         properties.put("useSSL", "false");
         properties.put("useLegacyDatetimeCode", "false");
         properties.put("serverTimezone", "UTC");
+
         try {
             DriverManager.registerDriver(new com.mysql.cj.jdbc.Driver());
-            connection =  DriverManager.getConnection(url,properties);
-        } catch (SQLException  e) {
-            e.printStackTrace();
+        } catch (SQLException e) {
+            throw new IllegalStateException("Unable to register MySQL driver", e);
+        }
+
+        int attempts = Math.max(1, maxAttempts);
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                connection = DriverManager.getConnection(url, properties);
+                initializeSchema();
+                return;
+            } catch (SQLException e) {
+                if (attempt == attempts) {
+                    throw new IllegalStateException("Unable to connect to DB after " + attempts + " attempt(s)", e);
+                }
+
+                System.out.println("DB is not ready yet, retry " + attempt + "/" + attempts);
+                try {
+                    Thread.sleep(retryDelayMs);
+                } catch (InterruptedException interruptedException) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("DB connection retry interrupted", interruptedException);
+                }
+            }
         }
     }
     public void closeConnection(){
         try {
-            connection.close();
+            if (connection != null && !connection.isClosed()) {
+                connection.close();
+            }
         } catch (SQLException e) {
             e.printStackTrace();
         }
     }
+
+    private void initializeSchema() throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate(
+                    "CREATE TABLE IF NOT EXISTS users (" +
+                            "user_id BIGINT PRIMARY KEY," +
+                            "username VARCHAR(255)," +
+                            "firstname VARCHAR(255)" +
+                            ")"
+            );
+            statement.executeUpdate(
+                    "CREATE TABLE IF NOT EXISTS chats (" +
+                            "chat_id BIGINT PRIMARY KEY," +
+                            "user_of_the_day VARCHAR(255)," +
+                            "loser_of_the_day VARCHAR(255)," +
+                            "user_of_the_day_run_day INT DEFAULT 0," +
+                            "loser_of_the_day_run_day INT DEFAULT 0" +
+                            ")"
+            );
+            statement.executeUpdate(
+                    "CREATE TABLE IF NOT EXISTS chat_user (" +
+                            "chat_id BIGINT NOT NULL," +
+                            "user_id BIGINT NOT NULL," +
+                            "user_day_counter INT DEFAULT 0," +
+                            "loser_counter INT DEFAULT 0," +
+                            "PRIMARY KEY (chat_id, user_id)," +
+                            "CONSTRAINT fk_chat_user_chat FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE," +
+                            "CONSTRAINT fk_chat_user_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE" +
+                            ")"
+            );
+        }
+    }
+
     public void registration(String chatId, User user)throws existedUserException{
-        String query = "SELECT * FROM chat_user WHERE chat_id=" + chatId + " AND user_id ="+user.getId();
-        try(Statement statement = connection.createStatement()){
-            if(statement.executeQuery(query).next()){
+        String query = "SELECT 1 FROM chat_user WHERE chat_id = ? AND user_id = ?";
+        try(
+                PreparedStatement selectStatement = connection.prepareStatement(query)
+        ){
+            selectStatement.setString(1, chatId);
+            selectStatement.setLong(2, user.getId());
+            if(selectStatement.executeQuery().next()){
                 throw new existedUserException();
             }else {
-                query = "INSERT INTO chat_user (chat_id,user_id) VALUE (" + chatId + "," + user.getId() + ")";
-                statement.executeUpdate(query);
+                ensureChatExists(chatId);
+                ensureUserExists(user);
 
-                try{
-                    query = "INSERT INTO users (user_id, username) " +
-                            "VALUE ("+user.getId()+",\""+user.getUserName()+"\")";
-                    statement.executeUpdate(query);
-                    query="UPDATE users SET firstname=\""+user.getFirstName()+"\" WHERE user_id="+user.getId();
-                    statement.executeUpdate(query);
-                }catch (SQLIntegrityConstraintViolationException e){
-                    System.out.println("user already exists in 'users'");
-                }
-                try{
-                    query = "INSERT INTO chats (chat_id) VALUE ("+chatId+")";
-                    statement.executeUpdate(query);
-                }catch (SQLIntegrityConstraintViolationException e){
-                    System.out.println("chat already exists in 'chats'");
+                query = "INSERT INTO chat_user (chat_id, user_id) VALUES (?, ?)";
+                try (PreparedStatement insertChatUser = connection.prepareStatement(query)) {
+                    insertChatUser.setString(1, chatId);
+                    insertChatUser.setLong(2, user.getId());
+                    insertChatUser.executeUpdate();
                 }
             }
         }catch (SQLException e){
             e.printStackTrace();
         }
     }
+
+    public boolean removeRegistration(String chatId, User user){
+        String query = "DELETE FROM chat_user WHERE chat_id = ? AND user_id = ?";
+        try (PreparedStatement statement = connection.prepareStatement(query)) {
+            statement.setString(1, chatId);
+            statement.setLong(2, user.getId());
+            return statement.executeUpdate() > 0;
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+        return false;
+    }
     public boolean isTheSameDayRunning(String chatId, int day, DBColumns column){
-        String query = "SELECT " + column + " FROM chats WHERE chat_id =" + chatId;
-        try(Statement statement = connection.createStatement()){
-            ResultSet result = statement.executeQuery(query);
+        String query = "SELECT " + column + " FROM chats WHERE chat_id = ?";
+        try(PreparedStatement statement = connection.prepareStatement(query)){
+            statement.setString(1, chatId);
+            ResultSet result = statement.executeQuery();
             if(result.next()){
                 return day == result.getInt(1);
             }
@@ -88,9 +159,12 @@ public class DBHandler {
     public List<UserForBD> getListOfPlayers(String chatId){
         List<UserForBD> players = new ArrayList<UserForBD>();
         UserForBD user;
-        String query = "select users.user_id,username,firstname,user_day_counter,loser_counter" + " from users join chat_user on chat_id="+chatId+" where chat_user.user_id=users.user_id";
-        try(Statement statement = connection.createStatement()){
-            ResultSet usersFromBD = statement.executeQuery(query);
+        String query = "SELECT users.user_id, username, firstname, user_day_counter, loser_counter " +
+                "FROM users JOIN chat_user ON chat_user.user_id = users.user_id " +
+                "WHERE chat_user.chat_id = ?";
+        try(PreparedStatement statement = connection.prepareStatement(query)){
+            statement.setString(1, chatId);
+            ResultSet usersFromBD = statement.executeQuery();
             while (usersFromBD.next()){
                 user = createUserForBD(usersFromBD);
                 user.setUserDayCounter(usersFromBD.getInt(4));
@@ -103,7 +177,7 @@ public class DBHandler {
         return players;
     }
     private UserForBD createUserForBD(ResultSet resultSet)throws SQLException{
-        return new UserForBD(resultSet.getInt(1),resultSet.getString(2),resultSet.getString(3));
+        return new UserForBD(resultSet.getLong(1),resultSet.getString(2),resultSet.getString(3));
     }
     public void setWinnerAndDayRunning(String chatId, UserForBD user, int dayRunning, Games column){
         String dayColumn = "";
@@ -118,18 +192,30 @@ public class DBHandler {
                 counterColumn = "loser_counter";
                 break;
         }
-        String query = "UPDATE chats SET " + column + " = \""+user.getName()+"\", " + dayColumn + " ="+dayRunning+" WHERE chat_id="+chatId;
-        try(Statement statement = connection.createStatement()){
-            statement.executeUpdate(query);
-            query = "UPDATE chat_user SET " + counterColumn + "="+counterColumn+"+1 WHERE chat_id="+chatId+" AND user_id="+user.getID();
-            statement.executeUpdate(query);
+        try(
+                PreparedStatement updateChat = connection.prepareStatement(
+                        "UPDATE chats SET " + column + " = ?, " + dayColumn + " = ? WHERE chat_id = ?"
+                );
+                PreparedStatement updateCounter = connection.prepareStatement(
+                        "UPDATE chat_user SET " + counterColumn + " = " + counterColumn + " + 1 WHERE chat_id = ? AND user_id = ?"
+                )
+        ){
+            updateChat.setString(1, user.getName());
+            updateChat.setInt(2, dayRunning);
+            updateChat.setString(3, chatId);
+            updateChat.executeUpdate();
+
+            updateCounter.setString(1, chatId);
+            updateCounter.setLong(2, user.getID());
+            updateCounter.executeUpdate();
         }catch (SQLException e){
             e.printStackTrace();
         }
     }
     public String getWinnerOfTheGame(String chatId,Games game){
-        try(Statement statement = connection.createStatement()){
-            ResultSet result = statement.executeQuery("SELECT " + game + " FROM chats WHERE chat_id="+chatId);
+        try(PreparedStatement statement = connection.prepareStatement("SELECT " + game + " FROM chats WHERE chat_id = ?")){
+            statement.setString(1, chatId);
+            ResultSet result = statement.executeQuery();
             if(result.next()){
                 return result.getString(1);
             }
@@ -137,5 +223,26 @@ public class DBHandler {
             e.printStackTrace();
         }
         return null;
+    }
+
+    private void ensureUserExists(User user) throws SQLException {
+        try (PreparedStatement insertUser = connection.prepareStatement(
+                "INSERT INTO users (user_id, username, firstname) VALUES (?, ?, ?) " +
+                        "ON DUPLICATE KEY UPDATE username = VALUES(username), firstname = VALUES(firstname)"
+        )) {
+            insertUser.setLong(1, user.getId());
+            insertUser.setString(2, user.getUserName());
+            insertUser.setString(3, user.getFirstName());
+            insertUser.executeUpdate();
+        }
+    }
+
+    private void ensureChatExists(String chatId) throws SQLException {
+        try (PreparedStatement insertChat = connection.prepareStatement(
+                "INSERT INTO chats (chat_id) VALUES (?) ON DUPLICATE KEY UPDATE chat_id = VALUES(chat_id)"
+        )) {
+            insertChat.setString(1, chatId);
+            insertChat.executeUpdate();
+        }
     }
 }

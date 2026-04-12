@@ -1,24 +1,24 @@
 package com.UserOfTheDayBot;
 
 public class UserForBD {
-    private final int ID;
+    private final long ID;
     private final String USERNAME;
     private final String FIRST_NAME;
     private int userDayCounter;
     private int loserDayCounter;
-    public UserForBD(int id,String username, String firstName) {
+    public UserForBD(long id,String username, String firstName) {
         this.ID = id;
         this.USERNAME = username;
         this.FIRST_NAME = firstName;
     }
 
     public String getName(){
-        return USERNAME.equals("null") ? FIRST_NAME : USERNAME;
+        return getDisplayName();
     }
     public String getNotificationName(){
-        return USERNAME.equals("null") ? FIRST_NAME : "@"+ USERNAME;
+        return getDisplayName();
     }
-    public int getID(){
+    public long getID(){
         return ID;
     }
     public void setUserDayCounter(int n){
@@ -34,6 +34,22 @@ public class UserForBD {
 
     public void setLoserDayCounter(int loserDayCounter) {
         this.loserDayCounter = loserDayCounter;
+    }
+
+    private String getDisplayName() {
+        boolean hasUsername = USERNAME != null && !USERNAME.equals("null") && !USERNAME.isEmpty();
+        boolean hasFirstName = FIRST_NAME != null && !FIRST_NAME.equals("null") && !FIRST_NAME.isEmpty();
+
+        if (hasFirstName && hasUsername) {
+            return FIRST_NAME + " (@" + USERNAME + ")";
+        }
+        if (hasFirstName) {
+            return FIRST_NAME;
+        }
+        if (hasUsername) {
+            return "@" + USERNAME;
+        }
+        return "Игрок";
     }
 
 //    @Override

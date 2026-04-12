@@ -1,0 +1,40 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: useroftheday-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-chats_users_db}
+      MYSQL_USER: ${DB_USER:-useroftheday}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-change_me_please}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  bot:
+    build:
+      context: .
+    container_name: useroftheday-bot
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      BOT_USERNAME: ${BOT_USERNAME:?BOT_USERNAME is required}
+      BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
+      BOT_TIMEZONE: ${BOT_TIMEZONE:-Europe/Moscow}
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-chats_users_db}
+      DB_USER: ${DB_USER:-useroftheday}
+      DB_PASSWORD: ${DB_PASSWORD:-change_me_please}
+      DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-20}
+      DB_CONNECT_RETRY_DELAY_MS: ${DB_CONNECT_RETRY_DELAY_MS:-3000}
