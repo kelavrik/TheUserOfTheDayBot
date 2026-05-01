@@ -78,7 +78,7 @@ public class Bot extends TelegramLongPollingBot {
     // Анимация для годовой церемонии. [0] — заголовок объявления (со %d для года),
     // [1..N-1] — suspense-сообщения, между ними MESSAGE_DELAY как у /run и /pidor.
     private final String[] yearHeroMessages = {
-            "🏆 КРАСАВЧИК ГОДА %d — ",
+            "🏆🏆 КРАСАВЧИК %d ГОДА 🏆🏆 — ",
             "ИТОГИ ПОДВЕДЕНЫ 🏁",
             "365 дней удачи позади 📅",
             "Складываем все победы за год 🧮",
@@ -88,13 +88,31 @@ public class Bot extends TelegramLongPollingBot {
     };
 
     private final String[] yearLoserMessages = {
-            "🌈 ПИДОР ГОДА %d — ",
+            "🌈🌈 ПИДОР %d ГОДА 🌈🌈 — ",
             "ИТОГОВАЯ СВОДКА ИНТЕРПОЛА 🚨",
             "365 дней наблюдения завершены 👁",
             "ФБР собрало все досье 🗂",
             "Глобальный розыск окончен 🚓",
             "Радужный флаг поднят 🏳",
             "АБСОЛЮТНЫЙ ЧЕМПИОН ГОДА 🏆🌈"
+    };
+
+    // Suspense-разогрев перед поздравлением «С Новым Годом».
+    private final String[] yearGreetingLeadIn = {
+            "🎄 ВНИМАНИЕ В ЭТОМ ЧАТЕ 🎄",
+            "На календаре 1 января 📅",
+            "Часы пробили полночь 🕛",
+            "Старый год закрывает дверь 🚪",
+            "Архивы готовы к запечатыванию 📦",
+            "Барабанная дробь главного выпуска года 🥁🥁🥁"
+    };
+
+    // Suspense-переход перед финальным «Стартует розыгрыш…».
+    private final String[] yearResetLeadIn = {
+            "Все имена занесены в анналы 📜",
+            "Счётчики готовы к обнулению ⚙",
+            "Переключаем календарь 🔁",
+            "Открываем новую страницу 📖"
     };
 
     public Bot(AppConfig config) {
@@ -184,7 +202,9 @@ public class Bot extends TelegramLongPollingBot {
 
         int messageDelayMs = 1500;
 
-        // 1. Поздравление
+        // 1a. Suspense-разогрев перед поздравлением
+        playSuspense(chatId, yearGreetingLeadIn, messageDelayMs);
+        // 1b. Финальное поздравление
         sendMsg(chatId,
                 "🎄🎁🎉 С НОВЫМ ГОДОМ! 🎉🎁🎄\n" +
                 "✨🌟💫🎆🎇💫🌟✨\n\n" +
@@ -203,10 +223,24 @@ public class Bot extends TelegramLongPollingBot {
             Thread.sleep(1500);
         }
 
-        // 4. Старт нового раунда
+        // 4a. Suspense-переход к новому году
+        playSuspense(chatId, yearResetLeadIn, messageDelayMs);
+        // 4b. Финальное «Стартует розыгрыш…»
         sendMsg(chatId,
                 "🎊 Стартует розыгрыш " + (finishedYear + 1) + "! 🎊\n" +
                 "Статистика обнулена, всем удачи в Новом Году! 🍾🥂🎈");
+    }
+
+    /**
+     * Шлёт каждую строку из {@code lines} в чат с задержкой
+     * {@code delayMs} между ними. Используется для suspense-цепочек,
+     * у которых нет реверса в конце (в отличие от revealAnimated).
+     */
+    private void playSuspense(String chatId, String[] lines, int delayMs) throws InterruptedException {
+        for (String line : lines) {
+            sendMsg(chatId, line);
+            Thread.sleep(delayMs);
+        }
     }
 
     /**
@@ -221,7 +255,7 @@ public class Bot extends TelegramLongPollingBot {
             Thread.sleep(messageDelayMs);
         }
         String header = String.format(messages[0], finishedYear);
-        sendMsg(chatId, header + winner.getNotificationName() + " — " + count + " раз(а)!");
+        sendMsg(chatId, header + winner.getNotificationName() + "!");
     }
 
     public void configureCommands() throws TelegramApiException {
