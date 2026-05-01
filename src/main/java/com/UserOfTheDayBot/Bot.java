@@ -20,6 +20,7 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
@@ -130,31 +131,40 @@ public class Bot extends TelegramLongPollingBot {
         scheduleNextYearEnd();
     }
 
-    /** Schedule the New Year ceremony for 00:00:00 of next Jan 1 in BOT_TIMEZONE.
-     *  After firing, the task re-schedules itself for the year after. */
+    /** Захват красавчика года, посчитанного на полночь, чтобы потом
+     *  разыграть его в hero-phase в 19:00. Капчуется в памяти; при рестарте
+     *  бота между полуночью и 19:00 hero-phase для этой ёлки пропадёт. */
+    private static final class YearEndCapture {
+        final UserForBD heroOfYear;
+        final int heroCount;
+        final int finishedYear;
+        final boolean hadPidor;
+        YearEndCapture(UserForBD heroOfYear, int heroCount, int finishedYear, boolean hadPidor) {
+            this.heroOfYear = heroOfYear;
+            this.heroCount = heroCount;
+            this.finishedYear = finishedYear;
+            this.hadPidor = hadPidor;
+        }
+    }
+
+    /** Schedule the midnight Jan 1 phase. After it runs, the midnight phase
+     *  schedules the 19:00 hero phase, which in turn re-schedules next year. */
     private void scheduleNextYearEnd() {
         ZoneId zone = ZoneId.of(config.getBotTimezone());
         ZonedDateTime now = ZonedDateTime.now(zone);
-        // The year that will end at the next midnight Jan 1 we're scheduling for.
         final int finishedYear = now.getYear();
         ZonedDateTime target = LocalDate.of(finishedYear + 1, 1, 1).atStartOfDay(zone);
         long delayMs = ChronoUnit.MILLIS.between(now, target);
-        if (delayMs <= 0) delayMs = 1000; // safety, should never happen
-        scheduler.schedule(() -> {
-            try {
-                runYearEndCeremony(finishedYear);
-            } catch (Throwable t) {
-                t.printStackTrace();
-            } finally {
-                scheduleNextYearEnd();
-            }
-        }, delayMs, TimeUnit.MILLISECONDS);
-        System.out.println("[year-end] ceremony scheduled for " + target + " (in " + (delayMs / 1000) + "s, finishedYear=" + finishedYear + ")");
+        if (delayMs <= 0) delayMs = 1000;
+        scheduler.schedule(() -> runMidnightPhase(finishedYear), delayMs, TimeUnit.MILLISECONDS);
+        System.out.println("[year-end] midnight phase scheduled for " + target + " (in " + (delayMs / 1000) + "s, finishedYear=" + finishedYear + ")");
     }
 
-    /** Iterate every chat, send the New Year sheet, and reset that chat's stats. */
-    private void runYearEndCeremony(int finishedYear) {
-        System.out.println("[year-end] running ceremony for finishedYear=" + finishedYear);
+    /** Полночь 1 января: поздравление + объявление пидора года.
+     *  Захватывает красавчика для последующей фазы и планирует её на 19:00 того же дня. */
+    private void runMidnightPhase(int finishedYear) {
+        System.out.println("[year-end] running midnight phase for finishedYear=" + finishedYear);
+        Map<String, YearEndCapture> heroQueue = new java.util.LinkedHashMap<String, YearEndCapture>();
         DBHandler dbHandler = new DBHandler(config);
         try {
             List<String> chatIds = dbHandler.getAllChatIds();
@@ -162,13 +172,14 @@ public class Bot extends TelegramLongPollingBot {
                 Object lock = CHAT_LOCKS.computeIfAbsent(chatId, k -> new Object());
                 synchronized (lock) {
                     try {
-                        announceYearEnd(chatId, finishedYear, dbHandler);
-                        dbHandler.resetChatStats(chatId);
+                        YearEndCapture capture = announceMidnightPhase(chatId, finishedYear, dbHandler);
+                        if (capture != null) {
+                            heroQueue.put(chatId, capture);
+                        }
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         return;
                     } catch (Throwable t) {
-                        // One bad chat shouldn't kill the ceremony for the rest.
                         t.printStackTrace();
                     }
                 }
@@ -176,21 +187,16 @@ public class Bot extends TelegramLongPollingBot {
         } finally {
             dbHandler.closeConnection();
         }
-        System.out.println("[year-end] ceremony done for finishedYear=" + finishedYear);
+        System.out.println("[year-end] midnight phase done; " + heroQueue.size() + " chats queued for hero phase");
+        scheduleHeroPhase(heroQueue);
     }
 
-    /**
-     * Годовая церемония для одного чата: поздравление → анимация «Красавчик
-     * года» (один победитель — с максимальным user_day_counter) → анимация
-     * «Пидор года» (один с максимальным loser_counter) → старт нового раунда.
-     *
-     * Анимации идут синхронно через Thread.sleep, лок чата держится до конца
-     * церемонии — это гарантирует, что одновременный /run или /pidor не
-     * прокинется между фазами и не использует частично сброшенное состояние.
-     */
-    private void announceYearEnd(String chatId, int finishedYear, DBHandler dbHandler) throws InterruptedException {
+    /** Полночь 1 января для одного чата: greeting lead-in → С Новым Годом
+     *  → пидор года. Возвращает capture с данными красавчика, который
+     *  будет разыгран в 19:00 — или null, если красавчика не нашлось. */
+    private YearEndCapture announceMidnightPhase(String chatId, int finishedYear, DBHandler dbHandler) throws InterruptedException {
         List<UserForBD> users = dbHandler.getListOfPlayers(chatId);
-        if (users.isEmpty()) return;
+        if (users.isEmpty()) return null;
 
         UserForBD heroOfYear = null;
         UserForBD pidorOfYear = null;
@@ -206,9 +212,8 @@ public class Bot extends TelegramLongPollingBot {
                 pidorOfYear = u;
             }
         }
-        // Если в этом году никто и /run, и /pidor ни разу не выиграл — молча
-        // пропустить чат, не спамить пустой церемонией.
-        if (heroOfYear == null && pidorOfYear == null) return;
+        // Никто не играл — церемонию для этого чата пропускаем целиком.
+        if (heroOfYear == null && pidorOfYear == null) return null;
 
         int messageDelayMs = 1500;
 
@@ -221,27 +226,83 @@ public class Bot extends TelegramLongPollingBot {
                 "Подводим итоги " + finishedYear + " года 🥁🥁🥁");
         Thread.sleep(2500);
 
-        // 2. Анимация «Пидор года» — сначала тёмная часть церемонии.
+        // 2. Анимация «Пидор года»
         if (pidorOfYear != null) {
             revealAnimated(chatId, yearLoserMessages, finishedYear, pidorOfYear, pidorCount, messageDelayMs);
-            Thread.sleep(1500);
         }
 
-        // 3. Переход к красавчику + сама анимация. Lead-in играет, только
-        // если до этого был пидор — иначе нечем «разворачиваться».
-        if (heroOfYear != null) {
-            if (pidorOfYear != null) {
-                playSuspense(chatId, yearHeroLeadIn, messageDelayMs);
+        // Красавчика разыграем в hero-phase в 19:00 этого же дня.
+        if (heroOfYear == null) return null;
+        return new YearEndCapture(heroOfYear, heroCount, finishedYear, pidorOfYear != null);
+    }
+
+    /** Запланировать hero-phase на ближайшие 19:00 (в BOT_TIMEZONE).
+     *  Очередь чатов уже захвачена. После hero-phase планируется
+     *  следующая полночь Jan 1. */
+    private void scheduleHeroPhase(Map<String, YearEndCapture> heroQueue) {
+        ZoneId zone = ZoneId.of(config.getBotTimezone());
+        ZonedDateTime now = ZonedDateTime.now(zone);
+        ZonedDateTime target = now.toLocalDate().atTime(19, 0).atZone(zone);
+        long delayMs = ChronoUnit.MILLIS.between(now, target);
+        if (delayMs <= 0) delayMs = 1000; // если midnight ушёл с задержкой и мы уже после 19:00
+        scheduler.schedule(() -> {
+            try {
+                runHeroPhase(heroQueue);
+            } catch (Throwable t) {
+                t.printStackTrace();
+            } finally {
+                scheduleNextYearEnd();
             }
-            revealAnimated(chatId, yearHeroMessages, finishedYear, heroOfYear, heroCount, messageDelayMs);
-            Thread.sleep(1500);
+        }, delayMs, TimeUnit.MILLISECONDS);
+        System.out.println("[year-end] hero phase scheduled for " + target + " (in " + (delayMs / 1000) + "s, " + heroQueue.size() + " chats)");
+    }
+
+    /** 19:00 1 января: lead-in → красавчик года → reset lead-in → финал.
+     *  Сброс счётчиков делается в самом конце под локом чата. */
+    private void runHeroPhase(Map<String, YearEndCapture> heroQueue) {
+        System.out.println("[year-end] running hero phase for " + heroQueue.size() + " chats");
+        DBHandler dbHandler = new DBHandler(config);
+        try {
+            for (Map.Entry<String, YearEndCapture> e : heroQueue.entrySet()) {
+                String chatId = e.getKey();
+                YearEndCapture cap = e.getValue();
+                Object lock = CHAT_LOCKS.computeIfAbsent(chatId, k -> new Object());
+                synchronized (lock) {
+                    try {
+                        announceHeroPhase(chatId, cap);
+                        dbHandler.resetChatStats(chatId);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    } catch (Throwable t) {
+                        t.printStackTrace();
+                    }
+                }
+            }
+        } finally {
+            dbHandler.closeConnection();
+        }
+        System.out.println("[year-end] hero phase done");
+    }
+
+    /** Hero-phase для одного чата: переход → красавчик → reset lead-in → финал.
+     *  Сам reset вызывается из runHeroPhase после возврата из этого метода. */
+    private void announceHeroPhase(String chatId, YearEndCapture cap) throws InterruptedException {
+        int messageDelayMs = 1500;
+
+        // Переход «с пидором разобрались» — только если в полночь был пидор.
+        if (cap.hadPidor) {
+            playSuspense(chatId, yearHeroLeadIn, messageDelayMs);
         }
 
-        // 4a. Suspense-переход к новому году
+        // Красавчик года
+        revealAnimated(chatId, yearHeroMessages, cap.finishedYear, cap.heroOfYear, cap.heroCount, messageDelayMs);
+        Thread.sleep(1500);
+
+        // Lead-in перед обнулением и финал
         playSuspense(chatId, yearResetLeadIn, messageDelayMs);
-        // 4b. Финальное «Стартует розыгрыш…»
         sendMsg(chatId,
-                "🎊 Стартует розыгрыш " + (finishedYear + 1) + "! 🎊\n" +
+                "🎊 Стартует розыгрыш " + (cap.finishedYear + 1) + "! 🎊\n" +
                 "Статистика обнулена, всем удачи в Новом Году! 🍾🥂🎈");
     }
 
