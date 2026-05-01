@@ -1,54 +1,54 @@
 # TheUserOfTheDayBot
 
-A Telegram bot that picks one «красавчик дня» (user of the day) and one «пидор
-дня» (loser of the day) at random from registered chat members. One pick per
-chat per day per game — calling the same command again the same day re-shows
-the cached winner instead of re-rolling.
+Телеграм-бот, который раз в сутки случайно выбирает «красавчика дня» и
+«пидора дня» из зарегистрированных участников чата. Один розыгрыш на чат
+в день для каждой игры — повторный вызов команды в тот же день покажет
+закэшированного победителя, а не перекатит выбор.
 
-## Commands
+## Команды
 
-| Command | What it does |
+| Команда | Что делает |
 |---|---|
-| `/reg` | Register yourself in the current chat |
-| `/delete` | Leave the game in the current chat |
-| `/run` | Pick today's «красавчик» |
-| `/pidor` | Pick today's «пидор» |
-| `/stats` | Leaderboard for `/run` |
-| `/pidorstats` | Leaderboard for `/pidor` |
+| `/reg` | Зарегистрироваться в розыгрыше в текущем чате |
+| `/delete` | Выйти из розыгрыша |
+| `/run` | Выбрать «красавчика дня» |
+| `/pidor` | Выбрать «пидора дня» |
+| `/stats` | Турнирная таблица для `/run` |
+| `/pidorstats` | Турнирная таблица для `/pidor` |
 
-## Selection algorithm
+## Алгоритм выбора
 
-* `java.security.SecureRandom` — uniform, no concerns about LCG bias or
-  predictable seeding.
-* Every registered player has probability `1/N`.
-* The "one pick per day" gate is anchored to `BOT_TIMEZONE`
-  (default `Europe/Moscow`).
-* Per-chat in-memory lock: two simultaneous `/run` or `/pidor` calls in the
-  same chat cannot both pick a winner — one runs, the other re-shows the
-  result.
-* Day stored as `LocalDate.toEpochDay()` (`BIGINT`), so no year-rollover
-  collisions.
+* `java.security.SecureRandom` — равномерное распределение, никаких претензий
+  к LCG-смещению или предсказуемости семени.
+* У каждого зарегистрированного игрока вероятность ровно `1/N`.
+* «Один розыгрыш в сутки» считается по `BOT_TIMEZONE` (по умолчанию
+  `Europe/Moscow`).
+* Лок per-chat (`ConcurrentHashMap<String, Object>`): два одновременных
+  `/run` или `/pidor` в одном чате не могут оба выбрать победителя — один
+  розыгрывает, второй показывает результат первого.
+* День хранится как `LocalDate.toEpochDay()` (`BIGINT`) — никаких коллизий
+  при переходе через год.
 
-## Stack
+## Стек
 
 * Java 8 (Eclipse Temurin)
 * [`telegrambots`](https://github.com/rubenlagus/TelegramBots)
-* MySQL 8 (schema auto-created on first start)
-* Maven build, Docker Compose deployment
+* MySQL 8 (схема создаётся автоматически при первом старте)
+* Maven для сборки, Docker Compose для деплоя
 
-## Configuration
+## Конфигурация
 
-Required:
+Обязательные:
 
-| Env var | Notes |
+| Переменная | Описание |
 |---|---|
-| `BOT_USERNAME` | bot's Telegram username, without `@` |
-| `BOT_TOKEN` | from [@BotFather](https://t.me/BotFather) |
-| `MYSQL_ROOT_PASSWORD` | MySQL root password |
+| `BOT_USERNAME` | username бота в Telegram, без `@` |
+| `BOT_TOKEN` | токен от [@BotFather](https://t.me/BotFather) |
+| `MYSQL_ROOT_PASSWORD` | пароль root для MySQL |
 
-Optional, with defaults:
+Опциональные, со значениями по умолчанию:
 
-| Env var | Default |
+| Переменная | Default |
 |---|---|
 | `BOT_TIMEZONE` | `Europe/Moscow` |
 | `DB_HOST` | `db` |
@@ -59,32 +59,34 @@ Optional, with defaults:
 | `DB_CONNECT_RETRIES` | `20` |
 | `DB_CONNECT_RETRY_DELAY_MS` | `3000` |
 
-## Run
+## Запуск
 
 ```bash
-# create .env with at least BOT_USERNAME, BOT_TOKEN, MYSQL_ROOT_PASSWORD
+# создай .env как минимум с BOT_USERNAME, BOT_TOKEN, MYSQL_ROOT_PASSWORD
 docker compose up -d
 docker compose logs -f bot
 ```
 
-The schema is created by the bot on first connection (idempotent — safe to
-restart).
+Схема создаётся ботом при первом подключении к БД. Перезапуски
+идемпотентны — данные не теряются.
 
-## Migrating an existing deployment past `8b31502`
+## Миграция существующего деплоя на `8b31502` и новее
 
-If your DB was created before this commit, the `chats.*_run_day` columns were
-`INT` holding `dayOfYear` (1..366) which collides across years. Switch them to
-`BIGINT` (epoch-day):
+Если БД создавалась до этого коммита, колонки `chats.user_of_the_day_run_day`
+и `chats.loser_of_the_day_run_day` были `INT` и хранили `dayOfYear` (1..366),
+который коллизит на каждом переходе через год. В новой версии — `BIGINT` с
+epoch-day:
 
 ```sql
 ALTER TABLE chats
   MODIFY user_of_the_day_run_day BIGINT NOT NULL DEFAULT 0,
   MODIFY loser_of_the_day_run_day BIGINT NOT NULL DEFAULT 0;
 
--- Optional: clear the cached winners so today's /run and /pidor re-roll.
+-- по желанию: сбросить кэш сегодняшних победителей,
+-- чтобы ближайший /run и /pidor сделали свежий выбор.
 UPDATE chats SET user_of_the_day = NULL, loser_of_the_day = NULL,
                  user_of_the_day_run_day = 0, loser_of_the_day_run_day = 0;
 ```
 
-Fresh deployments don't need this — `initializeSchema()` already declares
-`BIGINT`.
+Чистым деплоям эта миграция не нужна — `initializeSchema()` сразу создаёт
+колонки `BIGINT`.
