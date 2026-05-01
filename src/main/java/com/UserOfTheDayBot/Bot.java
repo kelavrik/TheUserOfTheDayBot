@@ -17,15 +17,28 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class Bot extends TelegramLongPollingBot {
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final ConcurrentHashMap<String, Object> CHAT_LOCKS = new ConcurrentHashMap<String, Object>();
+    private static final String[] MEDALS = {"🥇", "🥈", "🥉"};
     private final AppConfig config;
+    // Daemon scheduler — runs the year-end ceremony at midnight Jan 1 in BOT_TIMEZONE.
+    // Daemon thread so it doesn't keep the JVM alive on its own.
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "year-end-ceremony");
+        t.setDaemon(true);
+        return t;
+    });
 
     //class for sending messages with delay
     class TimerSendingTask extends TimerTask {
@@ -65,6 +78,109 @@ public class Bot extends TelegramLongPollingBot {
 
     public Bot(AppConfig config) {
         this.config = config;
+        scheduleNextYearEnd();
+    }
+
+    /** Schedule the New Year ceremony for 00:00:00 of next Jan 1 in BOT_TIMEZONE.
+     *  After firing, the task re-schedules itself for the year after. */
+    private void scheduleNextYearEnd() {
+        ZoneId zone = ZoneId.of(config.getBotTimezone());
+        ZonedDateTime now = ZonedDateTime.now(zone);
+        // The year that will end at the next midnight Jan 1 we're scheduling for.
+        final int finishedYear = now.getYear();
+        ZonedDateTime target = LocalDate.of(finishedYear + 1, 1, 1).atStartOfDay(zone);
+        long delayMs = ChronoUnit.MILLIS.between(now, target);
+        if (delayMs <= 0) delayMs = 1000; // safety, should never happen
+        scheduler.schedule(() -> {
+            try {
+                runYearEndCeremony(finishedYear);
+            } catch (Throwable t) {
+                t.printStackTrace();
+            } finally {
+                scheduleNextYearEnd();
+            }
+        }, delayMs, TimeUnit.MILLISECONDS);
+        System.out.println("[year-end] ceremony scheduled for " + target + " (in " + (delayMs / 1000) + "s, finishedYear=" + finishedYear + ")");
+    }
+
+    /** Iterate every chat, send the New Year sheet, and reset that chat's stats. */
+    private void runYearEndCeremony(int finishedYear) {
+        System.out.println("[year-end] running ceremony for finishedYear=" + finishedYear);
+        DBHandler dbHandler = new DBHandler(config);
+        try {
+            List<String> chatIds = dbHandler.getAllChatIds();
+            for (String chatId : chatIds) {
+                Object lock = CHAT_LOCKS.computeIfAbsent(chatId, k -> new Object());
+                synchronized (lock) {
+                    try {
+                        announceYearEnd(chatId, finishedYear, dbHandler);
+                        dbHandler.resetChatStats(chatId);
+                    } catch (Throwable t) {
+                        // One bad chat shouldn't kill the ceremony for the rest.
+                        t.printStackTrace();
+                    }
+                }
+            }
+        } finally {
+            dbHandler.closeConnection();
+        }
+        System.out.println("[year-end] ceremony done for finishedYear=" + finishedYear);
+    }
+
+    /** Send the four-message New Year sheet to a single chat. */
+    private void announceYearEnd(String chatId, int finishedYear, DBHandler dbHandler) {
+        List<UserForBD> users = dbHandler.getListOfPlayers(chatId);
+        if (users.isEmpty()) return;
+
+        int totalHero = 0;
+        int totalLoser = 0;
+        for (UserForBD u : users) {
+            totalHero += u.getUserDayCounter();
+            totalLoser += u.getLoserDayCounter();
+        }
+        // If no one has played this year, skip — no point in spamming an empty leaderboard.
+        if (totalHero == 0 && totalLoser == 0) return;
+
+        // 1. Поздравление
+        sendMsg(chatId,
+                "🎄🎁🎉 С НОВЫМ ГОДОМ! 🎉🎁🎄\n" +
+                "✨🌟💫🎆🎇💫🌟✨\n\n" +
+                "Подводим итоги " + finishedYear + " года 🥁🥁🥁");
+
+        // 2. Топ красавчиков
+        if (totalHero > 0) {
+            users.sort((a, b) -> Integer.compare(b.getUserDayCounter(), a.getUserDayCounter()));
+            StringBuilder sb = new StringBuilder();
+            sb.append("🏆✨ КРАСАВЧИК ГОДА ").append(finishedYear).append(" ✨🏆\n\n");
+            appendLeaderboard(sb, users, true);
+            sendMsg(chatId, sb.toString());
+        }
+
+        // 3. Топ пидоров
+        if (totalLoser > 0) {
+            users.sort((a, b) -> Integer.compare(b.getLoserDayCounter(), a.getLoserDayCounter()));
+            StringBuilder sb = new StringBuilder();
+            sb.append("🌈🚨 ПИДОР ГОДА ").append(finishedYear).append(" 🚨🌈\n\n");
+            appendLeaderboard(sb, users, false);
+            sendMsg(chatId, sb.toString());
+        }
+
+        // 4. Старт нового раунда
+        sendMsg(chatId,
+                "🎊 Стартует розыгрыш " + (finishedYear + 1) + "! 🎊\n" +
+                "Статистика обнулена, всем удачи в Новом Году! 🍾🥂🎈");
+    }
+
+    private static void appendLeaderboard(StringBuilder sb, List<UserForBD> users, boolean hero) {
+        int rank = 0;
+        for (UserForBD u : users) {
+            int count = hero ? u.getUserDayCounter() : u.getLoserDayCounter();
+            if (count == 0) continue; // skip non-participants
+            rank++;
+            String prefix = rank <= 3 ? MEDALS[rank - 1] : (rank + ")");
+            sb.append(prefix).append(" ").append(u.getNotificationName())
+              .append(" — ").append(count).append(" раз(а)\n");
+        }
     }
 
     public void configureCommands() throws TelegramApiException {

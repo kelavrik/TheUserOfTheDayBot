@@ -232,6 +232,36 @@ public class DBHandler {
         return null;
     }
 
+    /** Все chat_id, в которых бот хоть раз вёл игру — нужны для годовой церемонии. */
+    public List<String> getAllChatIds() {
+        List<String> ids = new ArrayList<String>();
+        try (PreparedStatement statement = connection.prepareStatement("SELECT chat_id FROM chats");
+             ResultSet rs = statement.executeQuery()) {
+            while (rs.next()) {
+                ids.add(String.valueOf(rs.getLong(1)));
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+        return ids;
+    }
+
+    /** Сбросить годовые счётчики и кэш сегодняшнего победителя для одного чата. */
+    public void resetChatStats(String chatId) {
+        try (PreparedStatement resetCounters = connection.prepareStatement(
+                "UPDATE chat_user SET user_day_counter = 0, loser_counter = 0 WHERE chat_id = ?");
+             PreparedStatement resetChat = connection.prepareStatement(
+                "UPDATE chats SET user_of_the_day = NULL, loser_of_the_day = NULL, " +
+                "user_of_the_day_run_day = 0, loser_of_the_day_run_day = 0 WHERE chat_id = ?")) {
+            resetCounters.setString(1, chatId);
+            resetCounters.executeUpdate();
+            resetChat.setString(1, chatId);
+            resetChat.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
     private void ensureUserExists(User user) throws SQLException {
         try (PreparedStatement insertUser = connection.prepareStatement(
                 "INSERT INTO users (user_id, username, firstname) VALUES (?, ?, ?) " +
