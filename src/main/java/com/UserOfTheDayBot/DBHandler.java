@@ -91,7 +91,14 @@ public class DBHandler {
                             // BIGINT to fit LocalDate.toEpochDay() (days since 1970-01-01).
                             // The previous INT held dayOfYear, which collides across years.
                             "user_of_the_day_run_day BIGINT NOT NULL DEFAULT 0," +
-                            "loser_of_the_day_run_day BIGINT NOT NULL DEFAULT 0" +
+                            "loser_of_the_day_run_day BIGINT NOT NULL DEFAULT 0," +
+                            // Pending hero captured at midnight Jan 1, разыгрывается в 19:00
+                            // того же дня. Если процесс перезапустился между 00:00 и 19:00 —
+                            // recovery читает эти поля и доигрывает церемонию.
+                            "pending_hero_display_name VARCHAR(255) NULL," +
+                            "pending_hero_count INT NULL," +
+                            "pending_hero_year INT NULL," +
+                            "pending_hero_had_pidor TINYINT(1) NULL" +
                             ")"
             );
             statement.executeUpdate(
@@ -246,17 +253,76 @@ public class DBHandler {
         return ids;
     }
 
-    /** Сбросить годовые счётчики и кэш сегодняшнего победителя для одного чата. */
+    /** Сбросить годовые счётчики, кэш сегодняшнего победителя и pending hero
+     *  для одного чата. Вызывается в конце hero-phase в 19:00 1 января. */
     public void resetChatStats(String chatId) {
         try (PreparedStatement resetCounters = connection.prepareStatement(
                 "UPDATE chat_user SET user_day_counter = 0, loser_counter = 0 WHERE chat_id = ?");
              PreparedStatement resetChat = connection.prepareStatement(
                 "UPDATE chats SET user_of_the_day = NULL, loser_of_the_day = NULL, " +
-                "user_of_the_day_run_day = 0, loser_of_the_day_run_day = 0 WHERE chat_id = ?")) {
+                "user_of_the_day_run_day = 0, loser_of_the_day_run_day = 0, " +
+                "pending_hero_display_name = NULL, pending_hero_count = NULL, " +
+                "pending_hero_year = NULL, pending_hero_had_pidor = NULL " +
+                "WHERE chat_id = ?")) {
             resetCounters.setString(1, chatId);
             resetCounters.executeUpdate();
             resetChat.setString(1, chatId);
             resetChat.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /** Сохранить captured красавчика года, чтобы пережить рестарт бота между
+     *  полуночью и 19:00 1 января. Перезаписывает существующие pending-данные. */
+    public void setPendingHero(String chatId, String displayName, int count, int finishedYear, boolean hadPidor) {
+        try (PreparedStatement stmt = connection.prepareStatement(
+                "UPDATE chats SET pending_hero_display_name = ?, pending_hero_count = ?, " +
+                "pending_hero_year = ?, pending_hero_had_pidor = ? WHERE chat_id = ?")) {
+            stmt.setString(1, displayName);
+            stmt.setInt(2, count);
+            stmt.setInt(3, finishedYear);
+            stmt.setInt(4, hadPidor ? 1 : 0);
+            stmt.setString(5, chatId);
+            stmt.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /** Pending hero для каждого чата, у которого есть незавершённая церемония.
+     *  Ключ — chat_id, значение — массив [displayName, count, year, hadPidor]
+     *  как Object[] (Java 8 без records). Вызывается на старте бота. */
+    public List<Object[]> getAllPendingHeroes() {
+        List<Object[]> rows = new ArrayList<Object[]>();
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT chat_id, pending_hero_display_name, pending_hero_count, " +
+                "pending_hero_year, pending_hero_had_pidor " +
+                "FROM chats WHERE pending_hero_year IS NOT NULL");
+             ResultSet rs = statement.executeQuery()) {
+            while (rs.next()) {
+                rows.add(new Object[] {
+                        String.valueOf(rs.getLong(1)),
+                        rs.getString(2),
+                        rs.getInt(3),
+                        rs.getInt(4),
+                        rs.getInt(5) != 0
+                });
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+        return rows;
+    }
+
+    /** Стереть pending hero без полного reset — нужен только в случае,
+     *  если данные «протухли» (бот пробудился через сутки после момента). */
+    public void clearPendingHero(String chatId) {
+        try (PreparedStatement stmt = connection.prepareStatement(
+                "UPDATE chats SET pending_hero_display_name = NULL, pending_hero_count = NULL, " +
+                "pending_hero_year = NULL, pending_hero_had_pidor = NULL WHERE chat_id = ?")) {
+            stmt.setString(1, chatId);
+            stmt.executeUpdate();
         } catch (SQLException e) {
             e.printStackTrace();
         }

@@ -129,18 +129,20 @@ public class Bot extends TelegramLongPollingBot {
     public Bot(AppConfig config) {
         this.config = config;
         scheduleNextYearEnd();
+        recoverPendingHeroPhase();
     }
 
-    /** Захват красавчика года, посчитанного на полночь, чтобы потом
-     *  разыграть его в hero-phase в 19:00. Капчуется в памяти; при рестарте
-     *  бота между полуночью и 19:00 hero-phase для этой ёлки пропадёт. */
+    /** Captured красавчика года, посчитанного на полночь, чтобы потом разыграть
+     *  его в hero-phase в 19:00. Дублируется в БД (`chats.pending_hero_*`) —
+     *  при рестарте бота между полуночью и 19:00 recoverPendingHeroPhase()
+     *  поднимет данные обратно и доиграет церемонию. */
     private static final class YearEndCapture {
-        final UserForBD heroOfYear;
+        final String heroDisplayName;
         final int heroCount;
         final int finishedYear;
         final boolean hadPidor;
-        YearEndCapture(UserForBD heroOfYear, int heroCount, int finishedYear, boolean hadPidor) {
-            this.heroOfYear = heroOfYear;
+        YearEndCapture(String heroDisplayName, int heroCount, int finishedYear, boolean hadPidor) {
+            this.heroDisplayName = heroDisplayName;
             this.heroCount = heroCount;
             this.finishedYear = finishedYear;
             this.hadPidor = hadPidor;
@@ -158,6 +160,48 @@ public class Bot extends TelegramLongPollingBot {
         if (delayMs <= 0) delayMs = 1000;
         scheduler.schedule(() -> runMidnightPhase(finishedYear), delayMs, TimeUnit.MILLISECONDS);
         System.out.println("[year-end] midnight phase scheduled for " + target + " (in " + (delayMs / 1000) + "s, finishedYear=" + finishedYear + ")");
+    }
+
+    /** Recovery после рестарта между полуночью и 19:00 1 января.
+     *  Читает chats.pending_hero_*. Если данные актуальны (today == Jan 1
+     *  следующего года после finishedYear) — поднимает hero-phase.
+     *  Если протухли (бот пробудился через сутки+) — стирает их. */
+    private void recoverPendingHeroPhase() {
+        DBHandler dbHandler = new DBHandler(config);
+        try {
+            List<Object[]> rows = dbHandler.getAllPendingHeroes();
+            if (rows.isEmpty()) return;
+
+            Map<String, YearEndCapture> queue = new java.util.LinkedHashMap<String, YearEndCapture>();
+            int firstYear = -1;
+            for (Object[] r : rows) {
+                String chatId = (String) r[0];
+                String name = (String) r[1];
+                int count = (Integer) r[2];
+                int year = (Integer) r[3];
+                boolean hadPidor = (Boolean) r[4];
+                if (firstYear == -1) firstYear = year;
+                queue.put(chatId, new YearEndCapture(name, count, year, hadPidor));
+            }
+
+            // Проверяем, актуальны ли данные. Все pending должны быть из одной
+            // полуночи (одного finishedYear). Считаем по первому.
+            ZoneId zone = ZoneId.of(config.getBotTimezone());
+            ZonedDateTime now = ZonedDateTime.now(zone);
+            LocalDate expectedDay = LocalDate.of(firstYear + 1, 1, 1);
+            if (!now.toLocalDate().equals(expectedDay)) {
+                System.out.println("[year-end] discarding stale pending hero data for finishedYear=" + firstYear + " (today=" + now.toLocalDate() + ", expected=" + expectedDay + ", " + queue.size() + " chats)");
+                for (String chatId : queue.keySet()) {
+                    dbHandler.clearPendingHero(chatId);
+                }
+                return;
+            }
+
+            System.out.println("[year-end] recovered pending hero data for finishedYear=" + firstYear + " (" + queue.size() + " chats), scheduling hero phase");
+            scheduleHeroPhase(queue);
+        } finally {
+            dbHandler.closeConnection();
+        }
     }
 
     /** Полночь 1 января: поздравление + объявление пидора года.
@@ -228,12 +272,17 @@ public class Bot extends TelegramLongPollingBot {
 
         // 2. Анимация «Пидор года»
         if (pidorOfYear != null) {
-            revealAnimated(chatId, yearLoserMessages, finishedYear, pidorOfYear, pidorCount, messageDelayMs);
+            revealAnimated(chatId, yearLoserMessages, finishedYear, pidorOfYear.getNotificationName(), pidorCount, messageDelayMs);
         }
 
         // Красавчика разыграем в hero-phase в 19:00 этого же дня.
+        // Capture сразу персистится в chats.pending_hero_* — это спасает церемонию
+        // при рестарте бота между 00:00 и 19:00 (recovery поднимет на старте).
         if (heroOfYear == null) return null;
-        return new YearEndCapture(heroOfYear, heroCount, finishedYear, pidorOfYear != null);
+        boolean hadPidor = pidorOfYear != null;
+        String heroDisplayName = heroOfYear.getNotificationName();
+        dbHandler.setPendingHero(chatId, heroDisplayName, heroCount, finishedYear, hadPidor);
+        return new YearEndCapture(heroDisplayName, heroCount, finishedYear, hadPidor);
     }
 
     /** Запланировать hero-phase на ближайшие 19:00 (в BOT_TIMEZONE).
@@ -295,8 +344,9 @@ public class Bot extends TelegramLongPollingBot {
             playSuspense(chatId, yearHeroLeadIn, messageDelayMs);
         }
 
-        // Красавчик года
-        revealAnimated(chatId, yearHeroMessages, cap.finishedYear, cap.heroOfYear, cap.heroCount, messageDelayMs);
+        // Красавчик года — берём имя из capture, чтобы переживать рестарты
+        // и не зависеть от того, что игрок остался в users/chat_user.
+        revealAnimated(chatId, yearHeroMessages, cap.finishedYear, cap.heroDisplayName, cap.heroCount, messageDelayMs);
         Thread.sleep(1500);
 
         // Lead-in перед обнулением и финал
@@ -319,18 +369,21 @@ public class Bot extends TelegramLongPollingBot {
     }
 
     /**
-     * Шлёт суспенс-сообщения [1..N-1] с задержкой messageDelayMs между ними,
-     * затем финальный реверс: header (с подставленным годом) + имя победителя
-     * и количество побед. Аналогично runGame, но синхронно — лок держится.
+     * Шлёт suspense-сообщения [1..N-1] с задержкой messageDelayMs между ними,
+     * затем финальный реверс: header (с подставленным годом) + winnerDisplayName + «!».
+     * Аналогично runGame, но синхронно — лок держится.
+     *
+     * Имя приходит готовой строкой (не UserForBD), чтобы можно было разыгрывать
+     * победителей по persisted-снимку из БД, не делая лишних JOIN'ов.
      */
     private void revealAnimated(String chatId, String[] messages, int finishedYear,
-                                UserForBD winner, int count, int messageDelayMs) throws InterruptedException {
+                                String winnerDisplayName, int count, int messageDelayMs) throws InterruptedException {
         for (int i = 1; i < messages.length; i++) {
             sendMsg(chatId, messages[i]);
             Thread.sleep(messageDelayMs);
         }
         String header = String.format(messages[0], finishedYear);
-        sendMsg(chatId, header + winner.getNotificationName() + "!");
+        sendMsg(chatId, header + winnerDisplayName + "!");
     }
 
     public void configureCommands() throws TelegramApiException {
