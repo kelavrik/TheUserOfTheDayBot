@@ -107,6 +107,16 @@ public class Bot extends TelegramLongPollingBot {
             "Барабанная дробь главного выпуска года 🥁🥁🥁"
     };
 
+    // Suspense-переход между объявлением пидора и красавчика.
+    // Меняет тон с тёмной церемонии на торжественную.
+    private final String[] yearHeroLeadIn = {
+            "Так, с пидором разобрались 😅",
+            "А теперь — без шуток, гран-при года 🏅",
+            "Барабаны переключаются на праздничный лад 🥁🎺",
+            "Корона ждёт своего хозяина 👑",
+            "ТАДАМ! 🎉🎉🎉"
+    };
+
     // Suspense-переход перед финальным «Стартует розыгрыш…».
     private final String[] yearResetLeadIn = {
             "Все имена занесены в анналы 📜",
@@ -211,15 +221,19 @@ public class Bot extends TelegramLongPollingBot {
                 "Подводим итоги " + finishedYear + " года 🥁🥁🥁");
         Thread.sleep(2500);
 
-        // 2. Анимация «Красавчик года»
-        if (heroOfYear != null) {
-            revealAnimated(chatId, yearHeroMessages, finishedYear, heroOfYear, heroCount, messageDelayMs);
+        // 2. Анимация «Пидор года» — сначала тёмная часть церемонии.
+        if (pidorOfYear != null) {
+            revealAnimated(chatId, yearLoserMessages, finishedYear, pidorOfYear, pidorCount, messageDelayMs);
             Thread.sleep(1500);
         }
 
-        // 3. Анимация «Пидор года»
-        if (pidorOfYear != null) {
-            revealAnimated(chatId, yearLoserMessages, finishedYear, pidorOfYear, pidorCount, messageDelayMs);
+        // 3. Переход к красавчику + сама анимация. Lead-in играет, только
+        // если до этого был пидор — иначе нечем «разворачиваться».
+        if (heroOfYear != null) {
+            if (pidorOfYear != null) {
+                playSuspense(chatId, yearHeroLeadIn, messageDelayMs);
+            }
+            revealAnimated(chatId, yearHeroMessages, finishedYear, heroOfYear, heroCount, messageDelayMs);
             Thread.sleep(1500);
         }
 
