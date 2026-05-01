@@ -13,15 +13,18 @@ import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 import com.UserOfTheDayBot.exceptions.existedUserException;
 
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.List;
-import java.util.Random;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Bot extends TelegramLongPollingBot {
+    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final ConcurrentHashMap<String, Object> CHAT_LOCKS = new ConcurrentHashMap<String, Object>();
     private final AppConfig config;
 
     //class for sending messages with delay
@@ -128,44 +131,50 @@ public class Bot extends TelegramLongPollingBot {
 
 
     private void runGame(String chatId,Games game){
-        DBHandler dbHandler = new DBHandler(config);
-        try {
-            List<UserForBD> usersInGame = dbHandler.getListOfPlayers(chatId);
-            String[] messages;
-            if (usersInGame.size() == 0) {
-                sendMsg(chatId,"Нет игроков");
-                return;
+        // Per-chat lock: guarantees only one /run or /pidor for a given chat is in flight at a time.
+        // Without this, two simultaneous commands could both pass the "is the same day" check,
+        // pick different winners, double-increment counters, and emit two announcements.
+        Object lock = CHAT_LOCKS.computeIfAbsent(chatId, k -> new Object());
+        synchronized (lock) {
+            DBHandler dbHandler = new DBHandler(config);
+            try {
+                List<UserForBD> usersInGame = dbHandler.getListOfPlayers(chatId);
+                String[] messages;
+                if (usersInGame.size() == 0) {
+                    sendMsg(chatId,"Нет игроков");
+                    return;
+                }
+                switch (game){
+                    case user_of_the_day:
+                        if (dbHandler.isTheSameDayRunning(chatId,getToday(), DBColumns.user_of_the_day_run_day)) {
+                            sendMsg(chatId,messagesForUserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.user_of_the_day));
+                            return;
+                        }
+                        messages = messagesForUserOfTheDay;
+                        break;
+                    case loser_of_the_day:
+                        if (dbHandler.isTheSameDayRunning(chatId,getToday(), DBColumns.loser_of_the_day_run_day)) {
+                            sendMsg(chatId, messagesForLoserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.loser_of_the_day));
+                            return;
+                        }
+                        messages = messagesForLoserOfTheDay;
+                        break;
+                    default:
+                        messages = null;
+                }
+                Timer timer = new Timer();
+                int MESSAGE_DELAY = 1500;
+                for(int  i = 1; i < messages.length; i++){
+                    timer.schedule(new TimerSendingTask(chatId,messages[i]),MESSAGE_DELAY*i);
+                }
+                int i = RANDOM.nextInt(usersInGame.size());
+                UserForBD winner = usersInGame.get(i);
+                timer.schedule(new TimerSendingTask(chatId, messages[0] + winner.getNotificationName()),
+                        MESSAGE_DELAY*messages.length);
+                dbHandler.setWinnerAndDayRunning(chatId,winner,getToday(),game);
+            } finally {
+                dbHandler.closeConnection();
             }
-            switch (game){
-                case user_of_the_day:
-                    if (dbHandler.isTheSameDayRunning(chatId,getToday(), DBColumns.user_of_the_day_run_day)) {
-                        sendMsg(chatId,messagesForUserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.user_of_the_day));
-                        return;
-                    }
-                    messages = messagesForUserOfTheDay;
-                    break;
-                case loser_of_the_day:
-                    if (dbHandler.isTheSameDayRunning(chatId,getToday(), DBColumns.loser_of_the_day_run_day)) {
-                        sendMsg(chatId, messagesForLoserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.loser_of_the_day));
-                        return;
-                    }
-                    messages = messagesForLoserOfTheDay;
-                    break;
-                default:
-                    messages = null;
-            }
-            Timer timer = new Timer();
-            int MESSAGE_DELAY = 1500;
-            for(int  i = 1; i < messages.length; i++){
-                timer.schedule(new TimerSendingTask(chatId,messages[i]),MESSAGE_DELAY*i);
-            }
-            int i = new Random().nextInt(usersInGame.size());
-            UserForBD winner = usersInGame.get(i);
-            timer.schedule(new TimerSendingTask(chatId, messages[0] + winner.getNotificationName()),
-                    MESSAGE_DELAY*messages.length);
-            dbHandler.setWinnerAndDayRunning(chatId,winner,getToday(),game);
-        } finally {
-            dbHandler.closeConnection();
         }
     }
     private void addUserInGame(String chatId, User user){
@@ -250,7 +259,9 @@ public class Bot extends TelegramLongPollingBot {
         return config.getBotToken();
     }
 
-    private int getToday(){
-        return LocalDate.now(ZoneId.of(config.getBotTimezone())).getDayOfYear();
+    private long getToday(){
+        // Use epoch-day (days since 1970-01-01) instead of dayOfYear (1..366):
+        // strictly monotonic, no collision when the year rolls over.
+        return LocalDate.now(ZoneId.of(config.getBotTimezone())).toEpochDay();
     }
 }

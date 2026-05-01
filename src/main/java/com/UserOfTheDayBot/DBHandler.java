@@ -88,8 +88,10 @@ public class DBHandler {
                             "chat_id BIGINT PRIMARY KEY," +
                             "user_of_the_day VARCHAR(255)," +
                             "loser_of_the_day VARCHAR(255)," +
-                            "user_of_the_day_run_day INT DEFAULT 0," +
-                            "loser_of_the_day_run_day INT DEFAULT 0" +
+                            // BIGINT to fit LocalDate.toEpochDay() (days since 1970-01-01).
+                            // The previous INT held dayOfYear, which collides across years.
+                            "user_of_the_day_run_day BIGINT NOT NULL DEFAULT 0," +
+                            "loser_of_the_day_run_day BIGINT NOT NULL DEFAULT 0" +
                             ")"
             );
             statement.executeUpdate(
@@ -142,13 +144,13 @@ public class DBHandler {
         }
         return false;
     }
-    public boolean isTheSameDayRunning(String chatId, int day, DBColumns column){
+    public boolean isTheSameDayRunning(String chatId, long day, DBColumns column){
         String query = "SELECT " + column + " FROM chats WHERE chat_id = ?";
         try(PreparedStatement statement = connection.prepareStatement(query)){
             statement.setString(1, chatId);
             ResultSet result = statement.executeQuery();
             if(result.next()){
-                return day == result.getInt(1);
+                return day == result.getLong(1);
             }
 
         }catch (SQLException e){
@@ -159,9 +161,14 @@ public class DBHandler {
     public List<UserForBD> getListOfPlayers(String chatId){
         List<UserForBD> players = new ArrayList<UserForBD>();
         UserForBD user;
+        // ORDER BY for deterministic position-to-user mapping. Doesn't affect uniformity of
+        // RANDOM.nextInt(size) — that's uniform regardless of order — but makes the algorithm
+        // reproducible (same seed + same DB state ⇒ same winner) and removes any latent dependency
+        // on InnoDB's implementation-defined ordering.
         String query = "SELECT users.user_id, username, firstname, user_day_counter, loser_counter " +
                 "FROM users JOIN chat_user ON chat_user.user_id = users.user_id " +
-                "WHERE chat_user.chat_id = ?";
+                "WHERE chat_user.chat_id = ? " +
+                "ORDER BY users.user_id";
         try(PreparedStatement statement = connection.prepareStatement(query)){
             statement.setString(1, chatId);
             ResultSet usersFromBD = statement.executeQuery();
@@ -179,7 +186,7 @@ public class DBHandler {
     private UserForBD createUserForBD(ResultSet resultSet)throws SQLException{
         return new UserForBD(resultSet.getLong(1),resultSet.getString(2),resultSet.getString(3));
     }
-    public void setWinnerAndDayRunning(String chatId, UserForBD user, int dayRunning, Games column){
+    public void setWinnerAndDayRunning(String chatId, UserForBD user, long dayRunning, Games column){
         String dayColumn = "";
         String counterColumn = "";
         switch (column){
@@ -201,7 +208,7 @@ public class DBHandler {
                 )
         ){
             updateChat.setString(1, user.getName());
-            updateChat.setInt(2, dayRunning);
+            updateChat.setLong(2, dayRunning);
             updateChat.setString(3, chatId);
             updateChat.executeUpdate();
 
