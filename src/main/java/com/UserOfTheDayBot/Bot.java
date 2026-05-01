@@ -30,7 +30,6 @@ import java.util.concurrent.TimeUnit;
 public class Bot extends TelegramLongPollingBot {
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final ConcurrentHashMap<String, Object> CHAT_LOCKS = new ConcurrentHashMap<String, Object>();
-    private static final String[] MEDALS = {"🥇", "🥈", "🥉"};
     private final AppConfig config;
     // Daemon scheduler — runs the year-end ceremony at midnight Jan 1 in BOT_TIMEZONE.
     // Daemon thread so it doesn't keep the JVM alive on its own.
@@ -76,6 +75,28 @@ public class Bot extends TelegramLongPollingBot {
 
     };
 
+    // Анимация для годовой церемонии. [0] — заголовок объявления (со %d для года),
+    // [1..N-1] — suspense-сообщения, между ними MESSAGE_DELAY как у /run и /pidor.
+    private final String[] yearHeroMessages = {
+            "🏆 КРАСАВЧИК ГОДА %d — ",
+            "ИТОГИ ПОДВЕДЕНЫ 🏁",
+            "365 дней удачи позади 📅",
+            "Складываем все победы за год 🧮",
+            "Сверяем лунные циклы 🌙",
+            "Корону уже несут 👑",
+            "ГРАНД-ПРИ НА ГОДОВОМ БАРАБАНЕ 🎯"
+    };
+
+    private final String[] yearLoserMessages = {
+            "🌈 ПИДОР ГОДА %d — ",
+            "ИТОГОВАЯ СВОДКА ИНТЕРПОЛА 🚨",
+            "365 дней наблюдения завершены 👁",
+            "ФБР собрало все досье 🗂",
+            "Глобальный розыск окончен 🚓",
+            "Радужный флаг поднят 🏳",
+            "АБСОЛЮТНЫЙ ЧЕМПИОН ГОДА 🏆🌈"
+    };
+
     public Bot(AppConfig config) {
         this.config = config;
         scheduleNextYearEnd();
@@ -115,6 +136,9 @@ public class Bot extends TelegramLongPollingBot {
                     try {
                         announceYearEnd(chatId, finishedYear, dbHandler);
                         dbHandler.resetChatStats(chatId);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
                     } catch (Throwable t) {
                         // One bad chat shouldn't kill the ceremony for the rest.
                         t.printStackTrace();
@@ -127,42 +151,56 @@ public class Bot extends TelegramLongPollingBot {
         System.out.println("[year-end] ceremony done for finishedYear=" + finishedYear);
     }
 
-    /** Send the four-message New Year sheet to a single chat. */
-    private void announceYearEnd(String chatId, int finishedYear, DBHandler dbHandler) {
+    /**
+     * Годовая церемония для одного чата: поздравление → анимация «Красавчик
+     * года» (один победитель — с максимальным user_day_counter) → анимация
+     * «Пидор года» (один с максимальным loser_counter) → старт нового раунда.
+     *
+     * Анимации идут синхронно через Thread.sleep, лок чата держится до конца
+     * церемонии — это гарантирует, что одновременный /run или /pidor не
+     * прокинется между фазами и не использует частично сброшенное состояние.
+     */
+    private void announceYearEnd(String chatId, int finishedYear, DBHandler dbHandler) throws InterruptedException {
         List<UserForBD> users = dbHandler.getListOfPlayers(chatId);
         if (users.isEmpty()) return;
 
-        int totalHero = 0;
-        int totalLoser = 0;
+        UserForBD heroOfYear = null;
+        UserForBD pidorOfYear = null;
+        int heroCount = 0;
+        int pidorCount = 0;
         for (UserForBD u : users) {
-            totalHero += u.getUserDayCounter();
-            totalLoser += u.getLoserDayCounter();
+            if (u.getUserDayCounter() > heroCount) {
+                heroCount = u.getUserDayCounter();
+                heroOfYear = u;
+            }
+            if (u.getLoserDayCounter() > pidorCount) {
+                pidorCount = u.getLoserDayCounter();
+                pidorOfYear = u;
+            }
         }
-        // If no one has played this year, skip — no point in spamming an empty leaderboard.
-        if (totalHero == 0 && totalLoser == 0) return;
+        // Если в этом году никто и /run, и /pidor ни разу не выиграл — молча
+        // пропустить чат, не спамить пустой церемонией.
+        if (heroOfYear == null && pidorOfYear == null) return;
+
+        int messageDelayMs = 1500;
 
         // 1. Поздравление
         sendMsg(chatId,
                 "🎄🎁🎉 С НОВЫМ ГОДОМ! 🎉🎁🎄\n" +
                 "✨🌟💫🎆🎇💫🌟✨\n\n" +
                 "Подводим итоги " + finishedYear + " года 🥁🥁🥁");
+        Thread.sleep(2500);
 
-        // 2. Топ красавчиков
-        if (totalHero > 0) {
-            users.sort((a, b) -> Integer.compare(b.getUserDayCounter(), a.getUserDayCounter()));
-            StringBuilder sb = new StringBuilder();
-            sb.append("🏆✨ КРАСАВЧИК ГОДА ").append(finishedYear).append(" ✨🏆\n\n");
-            appendLeaderboard(sb, users, true);
-            sendMsg(chatId, sb.toString());
+        // 2. Анимация «Красавчик года»
+        if (heroOfYear != null) {
+            revealAnimated(chatId, yearHeroMessages, finishedYear, heroOfYear, heroCount, messageDelayMs);
+            Thread.sleep(1500);
         }
 
-        // 3. Топ пидоров
-        if (totalLoser > 0) {
-            users.sort((a, b) -> Integer.compare(b.getLoserDayCounter(), a.getLoserDayCounter()));
-            StringBuilder sb = new StringBuilder();
-            sb.append("🌈🚨 ПИДОР ГОДА ").append(finishedYear).append(" 🚨🌈\n\n");
-            appendLeaderboard(sb, users, false);
-            sendMsg(chatId, sb.toString());
+        // 3. Анимация «Пидор года»
+        if (pidorOfYear != null) {
+            revealAnimated(chatId, yearLoserMessages, finishedYear, pidorOfYear, pidorCount, messageDelayMs);
+            Thread.sleep(1500);
         }
 
         // 4. Старт нового раунда
@@ -171,16 +209,19 @@ public class Bot extends TelegramLongPollingBot {
                 "Статистика обнулена, всем удачи в Новом Году! 🍾🥂🎈");
     }
 
-    private static void appendLeaderboard(StringBuilder sb, List<UserForBD> users, boolean hero) {
-        int rank = 0;
-        for (UserForBD u : users) {
-            int count = hero ? u.getUserDayCounter() : u.getLoserDayCounter();
-            if (count == 0) continue; // skip non-participants
-            rank++;
-            String prefix = rank <= 3 ? MEDALS[rank - 1] : (rank + ")");
-            sb.append(prefix).append(" ").append(u.getNotificationName())
-              .append(" — ").append(count).append(" раз(а)\n");
+    /**
+     * Шлёт суспенс-сообщения [1..N-1] с задержкой messageDelayMs между ними,
+     * затем финальный реверс: header (с подставленным годом) + имя победителя
+     * и количество побед. Аналогично runGame, но синхронно — лок держится.
+     */
+    private void revealAnimated(String chatId, String[] messages, int finishedYear,
+                                UserForBD winner, int count, int messageDelayMs) throws InterruptedException {
+        for (int i = 1; i < messages.length; i++) {
+            sendMsg(chatId, messages[i]);
+            Thread.sleep(messageDelayMs);
         }
+        String header = String.format(messages[0], finishedYear);
+        sendMsg(chatId, header + winner.getNotificationName() + " — " + count + " раз(а)!");
     }
 
     public void configureCommands() throws TelegramApiException {
