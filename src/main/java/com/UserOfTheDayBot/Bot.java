@@ -643,7 +643,18 @@ public class Bot extends TelegramLongPollingBot {
         try {
             execute(sendMessage);
         } catch (TelegramApiException e) {
-            e.printStackTrace();
+            // Чаще всего это «can't parse entities»: текст (например, фраза от
+            // LLM или имя игрока) содержит незакрытый Markdown-спецсимвол.
+            // Откатываемся на plain-text — лучше отправить без форматирования,
+            // чем потерять сообщение и порвать анимацию.
+            SendMessage plain = new SendMessage();
+            plain.setChatId(chatId);
+            plain.setText(s);
+            try {
+                execute(plain);
+            } catch (TelegramApiException e2) {
+                e2.printStackTrace();
+            }
         }
     }
     //method returns signed up username of bot
