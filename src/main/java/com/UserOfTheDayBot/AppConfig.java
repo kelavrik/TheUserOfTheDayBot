@@ -9,6 +9,8 @@ public class AppConfig {
     private final String botTimezone;
     private final int dbConnectRetries;
     private final long dbConnectRetryDelayMs;
+    private final String openrouterApiKey;
+    private final String openrouterModel;
 
     private AppConfig(
             String botUsername,
@@ -18,7 +20,9 @@ public class AppConfig {
             String dbPassword,
             String botTimezone,
             int dbConnectRetries,
-            long dbConnectRetryDelayMs
+            long dbConnectRetryDelayMs,
+            String openrouterApiKey,
+            String openrouterModel
     ) {
         this.botUsername = botUsername;
         this.botToken = botToken;
@@ -28,6 +32,8 @@ public class AppConfig {
         this.botTimezone = botTimezone;
         this.dbConnectRetries = dbConnectRetries;
         this.dbConnectRetryDelayMs = dbConnectRetryDelayMs;
+        this.openrouterApiKey = openrouterApiKey;
+        this.openrouterModel = openrouterModel;
     }
 
     public static AppConfig fromEnv() {
@@ -47,7 +53,11 @@ public class AppConfig {
                 readEnvOrDefault("DB_PASSWORD", "root"),
                 readEnvOrDefault("BOT_TIMEZONE", "Europe/Moscow"),
                 parseInt(readEnvOrDefault("DB_CONNECT_RETRIES", "15"), 15),
-                parseLong(readEnvOrDefault("DB_CONNECT_RETRY_DELAY_MS", "3000"), 3000L)
+                parseLong(readEnvOrDefault("DB_CONNECT_RETRY_DELAY_MS", "3000"), 3000L),
+                // Optional: если ключа нет — LLM-генерация suspense просто
+                // отключается и бот падает обратно к хардкод-строкам.
+                readEnvOrDefault("OPENROUTER_API_KEY", ""),
+                readEnvOrDefault("OPENROUTER_MODEL", "google/gemini-2.5-flash-lite")
         );
     }
 
@@ -81,6 +91,14 @@ public class AppConfig {
 
     public long getDbConnectRetryDelayMs() {
         return dbConnectRetryDelayMs;
+    }
+
+    public String getOpenrouterApiKey() {
+        return openrouterApiKey;
+    }
+
+    public String getOpenrouterModel() {
+        return openrouterModel;
     }
 
     private static String requireEnv(String name) {

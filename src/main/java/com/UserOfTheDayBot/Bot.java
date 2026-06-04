@@ -32,13 +32,18 @@ public class Bot extends TelegramLongPollingBot {
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final ConcurrentHashMap<String, Object> CHAT_LOCKS = new ConcurrentHashMap<String, Object>();
     private final AppConfig config;
-    // Daemon scheduler — runs the year-end ceremony at midnight Jan 1 in BOT_TIMEZONE.
-    // Daemon thread so it doesn't keep the JVM alive on its own.
+    // Daemon scheduler — runs the year-end ceremony at midnight Jan 1 in BOT_TIMEZONE
+    // и daily-refresh для LLM-suspense. Daemon thread, чтоб не держал JVM сам.
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "year-end-ceremony");
+        Thread t = new Thread(r, "uotd-scheduler");
         t.setDaemon(true);
         return t;
     });
+
+    // LLM-сгенерённые suspense-цепочки для /run и /pidor. Обновляются на старте
+    // и в полночь BOT_TIMEZONE. null → используется хардкод-фоллбек.
+    private volatile String[] llmUserSuspense;
+    private volatile String[] llmLoserSuspense;
 
     //class for sending messages with delay
     class TimerSendingTask extends TimerTask {
@@ -130,6 +135,79 @@ public class Bot extends TelegramLongPollingBot {
         this.config = config;
         scheduleNextYearEnd();
         recoverPendingHeroPhase();
+        refreshLlmSuspenseAsync();
+        scheduleDailyLlmRefresh();
+    }
+
+    private static final String USER_SUSPENSE_PROMPT =
+            "Сгенерируй ровно 6 коротких русских suspense-фраз для бота, который " +
+            "выбирает «красавчика дня» в Telegram-чате друзей. Стиль: ироничный, " +
+            "мемный, интернет-абсурд, как «гадаем на бинарных опционах», «лунный " +
+            "гороскоп», «лунная призма», «сектор приз на барабане». Тон бодрый, без " +
+            "оскорблений.\n\n" +
+            "Каждая фраза — 2–10 слов, ровно с 1–2 emoji в любом месте строки. Не " +
+            "повторяй приведённые выше примеры дословно, придумай новые.\n\n" +
+            "Вывод: РОВНО 6 строк, по одной фразе на строку, БЕЗ нумерации, БЕЗ " +
+            "кавычек, БЕЗ объяснений, БЕЗ заголовков.";
+
+    private static final String LOSER_SUSPENSE_PROMPT =
+            "Сгенерируй ровно 6 коротких русских suspense-фраз для бота, который " +
+            "выбирает «пидора дня» (это шуточная игра в Telegram-чате друзей, " +
+            "никакой настоящей агрессии, дружеский абсурд). Стиль: «федеральный " +
+            "розыск пидора», «сводки Интерпола проверены», «спутник запущен», " +
+            "отсчёт «4… 3… 2… 1…», ФБР, ЦРУ, досье, ориентировки, наблюдение, " +
+            "ракеты, спецназ, расследование.\n\n" +
+            "Каждая фраза — 2–10 слов, ровно с 1–2 emoji в любом месте строки. Не " +
+            "повторяй приведённые примеры дословно.\n\n" +
+            "Вывод: РОВНО 6 строк, по одной фразе на строку, БЕЗ нумерации, БЕЗ " +
+            "кавычек, БЕЗ объяснений, БЕЗ заголовков.";
+
+    /** Сгенерировать обе цепочки в фоне. Не блокирует /run и /pidor — пока
+     *  цепочка не получена, бот использует хардкод-фоллбек. */
+    private void refreshLlmSuspenseAsync() {
+        if (config.getOpenrouterApiKey() == null || config.getOpenrouterApiKey().isEmpty()) {
+            System.out.println("[llm] OPENROUTER_API_KEY not set, suspense generation disabled");
+            return;
+        }
+        Thread t = new Thread(() -> {
+            String[] user = LlmClient.generateLines(
+                    config.getOpenrouterApiKey(), config.getOpenrouterModel(),
+                    USER_SUSPENSE_PROMPT, 6, 20);
+            if (user != null) llmUserSuspense = user;
+            String[] loser = LlmClient.generateLines(
+                    config.getOpenrouterApiKey(), config.getOpenrouterModel(),
+                    LOSER_SUSPENSE_PROMPT, 6, 20);
+            if (loser != null) llmLoserSuspense = loser;
+            System.out.println("[llm] suspense refreshed: user=" + (user != null) + ", loser=" + (loser != null));
+        }, "llm-suspense-refresh");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Раз в сутки в 00:00 BOT_TIMEZONE перегенерить suspense — иначе при
+     *  uptime'е в недели бот будет крутить один и тот же набор. */
+    private void scheduleDailyLlmRefresh() {
+        if (config.getOpenrouterApiKey() == null || config.getOpenrouterApiKey().isEmpty()) {
+            return;
+        }
+        ZoneId zone = ZoneId.of(config.getBotTimezone());
+        ZonedDateTime now = ZonedDateTime.now(zone);
+        ZonedDateTime nextMidnight = now.toLocalDate().plusDays(1).atStartOfDay(zone);
+        long delayMs = ChronoUnit.MILLIS.between(now, nextMidnight);
+        if (delayMs <= 0) delayMs = 60_000;
+        scheduler.scheduleAtFixedRate(this::refreshLlmSuspenseAsync,
+                delayMs, 24L * 60 * 60 * 1000, TimeUnit.MILLISECONDS);
+        System.out.println("[llm] daily suspense refresh scheduled, first at " + nextMidnight);
+    }
+
+    /** Собрать эффективный массив для анимации: [0] всегда хардкод (шаблон с
+     *  именем победителя), [1..N-1] — из LLM-кэша если есть, иначе хардкод. */
+    private String[] effectiveMessages(String[] hardcoded, String[] llm) {
+        if (llm == null || llm.length == 0) return hardcoded;
+        String[] result = new String[1 + llm.length];
+        result[0] = hardcoded[0];
+        System.arraycopy(llm, 0, result, 1, llm.length);
+        return result;
     }
 
     /** Captured красавчика года, посчитанного на полночь, чтобы потом разыграть
@@ -469,14 +547,14 @@ public class Bot extends TelegramLongPollingBot {
                             sendMsg(chatId,messagesForUserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.user_of_the_day));
                             return;
                         }
-                        messages = messagesForUserOfTheDay;
+                        messages = effectiveMessages(messagesForUserOfTheDay, llmUserSuspense);
                         break;
                     case loser_of_the_day:
                         if (dbHandler.isTheSameDayRunning(chatId,getToday(), DBColumns.loser_of_the_day_run_day)) {
                             sendMsg(chatId, messagesForLoserOfTheDay[0] + dbHandler.getWinnerOfTheGame(chatId,Games.loser_of_the_day));
                             return;
                         }
-                        messages = messagesForLoserOfTheDay;
+                        messages = effectiveMessages(messagesForLoserOfTheDay, llmLoserSuspense);
                         break;
                     default:
                         messages = null;
